@@ -20,6 +20,9 @@ Requires Python 3.11 or later, Git, an EMQX Cloud account, and a local Codex or
 Claude Code installation. The server runs on your computer and requires network
 access to your Cloud API endpoints; it does not require an EMQX internal network.
 
+The Python distribution is named `emqx-cloud-mcp-server`. The installed command
+is `emqx-cloud-mcp`, and the Python module is `emqxcloud_mcp`.
+
 On macOS or Linux:
 
 ```sh

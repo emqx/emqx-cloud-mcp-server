@@ -40,5 +40,5 @@ jobs:
       - run: bandit -q emqxcloud_mcp.py
       - name: Audit resolved runtime dependencies
         run: |
-          python -c "import importlib.metadata as m; from pathlib import Path; names={d.metadata['Name']:d.version for d in m.distributions() if d.metadata['Name'].lower() != 'emqx-cloud-mcp'}; Path('audit-requirements.txt').write_text(''.join(f'{name}=={version}\n' for name,version in sorted(names.items())))"
+          python -c "import importlib.metadata as m; from pathlib import Path; names={d.metadata['Name']:d.version for d in m.distributions() if d.metadata['Name'].lower() != 'emqx-cloud-mcp-server'}; Path('audit-requirements.txt').write_text(''.join(f'{name}=={version}\n' for name,version in sorted(names.items())))"
           pip-audit --disable-pip --no-deps -r audit-requirements.txt

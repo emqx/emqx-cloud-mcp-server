@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "emqx-cloud-mcp"
+name = "emqx-cloud-mcp-server"
 version = "0.2.0"
 description = "Local MCP tools for EMQX Cloud Platform and Deployment APIs"
 readme = "README.md"
