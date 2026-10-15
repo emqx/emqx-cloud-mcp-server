@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emqx-cloud-mcp"
+version = "0.2.0"
+description = "Local MCP tools for EMQX Cloud Platform and Deployment APIs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["mcp==2.3.0", "httpx2>=2.13,<3", "pydantic>=2.14,<3"]
+
+[project.urls]
+Repository = "https://github.com/emqx/emqx-cloud-mcp-server"
+Issues = "https://github.com/emqx/emqx-cloud-mcp-server/issues"
+
+[project.scripts]
+emqx-cloud-mcp = "emqxcloud_mcp:main"
+
+[tool.setuptools]
+py-modules = ["emqxcloud_mcp"]

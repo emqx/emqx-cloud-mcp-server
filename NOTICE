@@ -1,0 +1,11 @@
+EMQX Cloud MCP
+Copyright (c) 2026 EMQ Technologies Co., Ltd.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+API credential separation, HTTP request safeguards, and resource request
+patterns are based on the EMQX Cloud Terraform Provider, also licensed
+under Apache-2.0:
+https://github.com/emqx/terraform-provider-emqxcloud
+
+This project does not redistribute private API contract snapshots.
