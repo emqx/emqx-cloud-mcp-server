@@ -16,6 +16,20 @@ credentials. Keep credentials and customer message data out of public issues.
   operations and integration changes require their documented startup flags.
   Cloud API key scopes and client approval settings provide additional controls;
   tool descriptions are not an authorization system.
+- Platform key issuance stores plaintext once-only credentials in private local
+  receipts. On POSIX, newly created files/directories use 0600/0700, and directory
+  entries are fsynced. Windows requires private ACLs verified by the operator;
+  POSIX mode arguments do not enforce those ACLs and directory fsync is unavailable.
+  The operator controls `--state-dir` and existing permissions. Protect and retain
+  this state across restarts and share it between processes managing the same account.
+  Results expose neither file paths nor credentials. Only operators outside the AI
+  client may configure credentials; agents must not read private files or copy their
+  contents into chat. This guidance cannot sandbox a host client's filesystem tools.
+  A per-deployment lock serializes scanning and issuance. Uncertain records or
+  temporary results block new IDs for the same endpoint/deployment; unreadable or
+  invalid records block issuance conservatively. A crash can leave a stale lock.
+  The operator must reconcile Console and private state before resolving these
+  records/locks. No remote key update/revocation is exposed.
 - Read results can contain client identifiers, IP addresses and message payloads.
   These reach the AI client and its configured provider/storage. `test_rule`
   requests disabled actions but can update rule metrics.

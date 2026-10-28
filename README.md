@@ -8,7 +8,7 @@ Choose one independent connection:
 
 | Mode | Purpose | Required credentials |
 | --- | --- | --- |
-| `platform` | List projects and deployments, create Dedicated Flex deployments, start deployments | Platform API endpoint, key, and secret |
+| `platform` | List projects and deployments, create Dedicated Flex deployments, start deployments, issue Deployment API keys | Platform API endpoint, key, and secret |
 | `deployment` | Inspect and operate one deployment: clients, subscriptions, metrics, built-in MQTT users and ACLs, banned list, retained messages, publishing, and data integration (connectors, actions, sources, rules) | Deployment API endpoint, key, and secret |
 
 Each mode exposes only its own tools and reads only its own API credentials.
@@ -57,7 +57,8 @@ Create a [Platform API key](https://docs.emqx.com/en/cloud/latest/api/api_platfo
 under **Settings → Platform API Key**, choosing the required functionality and
 projects. For broker operations, create a separate
 [Deployment API key](https://docs.emqx.com/en/cloud/latest/api/api_deployment.html)
-on the target deployment's overview page. Map its **App ID** to
+on the target deployment's overview page, or issue one using the Platform
+`create_deployment_api_key` tool. Map its **App ID** to
 `EMQXCLOUD_DEPLOYMENT_API_KEY` and **App Secret** to
 `EMQXCLOUD_DEPLOYMENT_API_SECRET`; these are not MQTT username/password credentials.
 
@@ -227,6 +228,8 @@ integration tools.
 | `list_projects` | Read | Lists visible projects |
 | `list_deployments` | Read | Lists visible deployments |
 | `get_deployment` | Read | Reads one deployment's actual status |
+| `get_deployment_api_key_receipt` | Read | Reads a local issuance record without returning credentials or calling Cloud |
+| `create_deployment_api_key` | Write | Issues one Deployment key with an explicit whitelist; retains the once-only secret in a private local receipt |
 | `create_deployment` | Write | Creates a paid Dedicated Flex deployment; requires project, cloud, region, connections and TPS; defaults to `v5`, also accepts `v6` |
 | `start_deployment` | Write | Starts a stopped deployment; an already-running deployment is a no-op |
 
@@ -348,24 +351,96 @@ variable from its own environment. Only `EMQXCLOUD_SECRET_*` names are accepted,
 their values are redacted from tool results, and they must be forwarded to the
 MCP process like the API credentials.
 
+### Connection information and key issuance
+
+`get_deployment` and `create_deployment` return `connection_info` from the Platform
+detail response: `address`, `api_endpoint`, and `ports` (`protocol`, `port`, `status`).
+Missing or null connections remain `null`; unavailable endpoints and listener
+status are preserved. Malformed connection data is unavailable, malformed listener
+entries become null, and a warning preserves the successful deployment result.
+The deployment list does not fetch connection details.
+
+With Platform `--allow-writes`, call `create_deployment_api_key` with:
+
+```json
+{
+  "deployment_id": "your-deployment-id",
+  "issuance_id": "bootstrap-readonly-1",
+  "whitelist": {"/api/v5/clients": ["GET"]},
+  "description": "Read clients for MCP validation"
+}
+```
+
+The exact deployment must be running Dedicated or Dedicated Flex. The Platform
+key needs deployment management and the separate `Deployment_API_Key` service.
+Cloud limits issuance to five keys per deployment and two successful creations
+per hour per Platform key. No default or implicit permissions are granted.
+
+The once-only `app_id` and `app_secret` remain in a local JSON receipt. Default
+storage is `$XDG_STATE_HOME/emqx-cloud-mcp`, falling back to
+`~/.local/state/emqx-cloud-mcp` when XDG_STATE_HOME is unset, empty or relative.
+`--state-dir` overrides this location. Use a dedicated private directory shared
+by all MCP processes managing the same account. Moving to another directory
+cannot carry forward the issuance safeguards unless its existing records move too.
+
+Tool results expose status and whether a temporary result exists, never file
+paths or credentials. **Operator action only, outside the AI client:** configure
+`EMQXCLOUD_DEPLOYMENT_*` locally from the private record. AI agents must not read
+receipt or temporary files through shell/filesystem tools or paste their contents
+into conversation. These instructions cannot restrict a host agent's independent
+filesystem access; configure that boundary in the AI client and operating system.
+Receipts contain plaintext secrets; exclude them from version control and shared
+backups.
+
+On POSIX, new receipt files use mode 0600 and new state directories use 0700.
+Directory entries are fsynced before POST and after temporary-file creation and
+replacement. Existing directory permissions remain the operator's responsibility.
+Windows does not enforce these POSIX modes or directory fsync; the operator must
+verify a private Windows ACL, particularly for a custom `--state-dir`.
+
+An exclusive receipt is saved before POST. Existing issuance IDs block creation,
+including after restart and on changed inputs. A per-platform-endpoint/deployment
+lock serializes the local scan and issuance across MCP processes. An uncertain
+record blocks **all new issuance IDs for that deployment**, including after
+restart. Temporary results also block new issuance for their deployment. Invalid
+or unreadable records block issuance conservatively. A crash may leave a `.lock`
+directory; it blocks further issuance for that deployment until operator recovery.
+Key updates, deletion and replacement tools remain unavailable with destructive
+access. Separately authorized new keys are allowed only after uncertain issuance
+has been resolved.
+
+Use `get_deployment_api_key_receipt` to recover local status without contacting
+Cloud or reissuing. `issued` means a complete HTTP 201 response was saved;
+`uncertain` means manual Console reconciliation is required; `rejected` means a
+confirmed API rejection was recorded. `temporary_result_available` warns that a
+`.tmp` file may contain the once-only result even when `secret_available` is false.
+The tool does not read or promote that temporary result. Partial credentials are
+preserved privately. The operator must reconcile issuance in Console and recover
+any private temporary result outside the AI client before manually resolving the
+uncertain record or stale lock; never discard recovery state just to retry.
+Receipts cannot recover a missing secret or detect remote revocation/permission
+drift. Clean dependent resources and revoke keys in Console before deliberate
+manual state transfer. Use the same private state directory after restarts.
+
 ## Create a deployment, then manage it
 
 1. Use a Platform connection to create the deployment and query its status.
-2. Once it is running, create a Deployment API key in the target deployment's
+2. Once it is running, use `create_deployment_api_key` or create a Deployment API key in the target deployment's
    Console page and copy its endpoint.
 3. Configure a separate Deployment connection with that endpoint and key.
 4. Use that connection to configure MQTT users, ACLs and data integration, and
    to inspect clients, subscriptions and metrics.
 
-The Platform API does not supply Deployment API credentials. The server does not
-guess MQTT addresses or Deployment API endpoints. Each Deployment connection
+Platform and Deployment API credentials are independent; the Platform key can
+issue a Deployment key only with the separate service permission. The server
+uses returned connection information without guessing endpoints. Each Deployment connection
 targets the endpoint configured by its operator; configuring multiple deployments
 requires separate connections with their own environment settings.
 
 ## First checks and example prompts
 
 After configuring a client, open `/mcp` and confirm the selected server is
-connected. A default Platform connection exposes 3 tools; a default Deployment
+connected. A default Platform connection exposes 4 tools; a default Deployment
 connection exposes 16. Start with a harmless read:
 
 - "List the projects and deployments available through emqx-cloud-platform."
