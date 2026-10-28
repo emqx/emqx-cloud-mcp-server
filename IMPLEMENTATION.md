@@ -54,7 +54,16 @@ distributed, generated from, or read at runtime.
 
 - Creation supports non-trial Dedicated Flex; the Platform API decides permitted regions and capacities.
 - Deployment tools target the published `/api/v5` contract, with basic ACL writes limited to permission/action/topic.
-- New-deployment management requires customer-created Deployment API credentials configured separately.
+- Platform detail/create results expose nullable `connection_info`, preserving listener status.
+- Platform key issuance requires explicit permissions and a running Dedicated/Flex deployment.
+  Exclusive private receipts are written before POST and retain once-only secrets or incomplete
+  issuance recovery state. Receipt reads never call Cloud and flag temporary recovery results.
+  Per-deployment locks serialize scanning and issuance. Uncertain or temporary records block
+  new issuance IDs for the same endpoint/deployment; invalid state fails closed.
+  Key updates, deletion and replacement are blocked. Results expose no secret or file path;
+  operators configure a separate Deployment connection outside the AI client.
+  XDG_STATE_HOME is honored; POSIX directory entries are fsynced. Windows ACLs must be
+  verified by the operator; POSIX modes and directory fsync do not provide Windows protection.
 - Deployment mode adds client/subscription/metrics reads, publishing, banned entries and data integration CRUD.
   `--allow-destructive` gates deletes, kickouts, bans and unbans; `--allow-integrations` gates data-integration
   changes separately because rules can forward all messages externally. Deployment stop/delete, TLS, schema registry, message

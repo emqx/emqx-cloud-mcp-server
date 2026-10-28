@@ -1,11 +1,14 @@
 """Hermetic API-contract and real stdio protocol tests; no live Cloud credentials."""
 
 import base64
+import asyncio
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -129,20 +132,23 @@ class APITests(unittest.IsolatedAsyncioTestCase):
 
 
 class ToolTests(unittest.IsolatedAsyncioTestCase):
-    async def call(self, mode, name, args, responses, *, writes=True, destructive=True, integrations=True, extra_env=None):
+    async def call(self, mode, name, args, responses, *, writes=True, destructive=True, integrations=True, extra_env=None, state_dir=None):
         self.requests = []
         def reply(request):
             self.requests.append(request)
             response = responses[len(self.requests) - 1]
+            if isinstance(response, Exception):
+                raise response
             return httpx2.Response(response[0], json=response[1])
         env = {**environment(mode), **(extra_env or {})}
         server = build_server(mode, writes, env, httpx2.AsyncClient(transport=httpx2.MockTransport(reply)),
-                              allow_destructive=destructive, allow_integrations=integrations)
+                              allow_destructive=destructive, allow_integrations=integrations, state_dir=state_dir)
         async with Client(server, raise_exceptions=True) as client:
             return await client.call_tool(name, args)
 
     async def test_modes_and_access_levels_are_separate(self):
-        platform = ({"list_projects", "list_deployments", "get_deployment"}, {"create_deployment", "start_deployment"},
+        platform = ({"list_projects", "list_deployments", "get_deployment", "get_deployment_api_key_receipt"},
+                    {"create_deployment", "start_deployment", "create_deployment_api_key"},
                     set(), set(), set())
         deployment = (DEPLOYMENT_READ, DEPLOYMENT_WRITE, DEPLOYMENT_DESTRUCTIVE, DEPLOYMENT_INTEGRATIONS,
                       DEPLOYMENT_INTEGRATIONS_DESTRUCTIVE)
@@ -173,6 +179,292 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertTrue(tool.annotations.destructive_hint)
                         self.assertNotIn("stop_deployment", names)
                         self.assertNotIn("delete_deployment", names)
+
+    async def test_uncertain_issuance_blocks_a_new_id_for_same_deployment(self):
+        args = {"deployment_id": "d", "issuance_id": "a", "whitelist": {"/api/v5/clients": ["GET"]}}
+        ready = (200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})
+        with tempfile.TemporaryDirectory() as directory:
+            result = await self.call("platform", "create_deployment_api_key", args, [ready, (503, {})], state_dir=directory)
+            self.assertEqual(output(result)["status"], "uncertain")
+            result = await self.call("platform", "create_deployment_api_key", args | {"issuance_id": "b"},
+                                     [ready, (201, {"appID": "ak", "appSecret": "secret"})], state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertEqual(self.requests, [])
+
+    async def test_tool_results_do_not_direct_agents_to_read_private_files(self):
+        args = {"deployment_id": "d", "issuance_id": "a", "whitelist": {"/api/v5/clients": ["GET"]}}
+        with tempfile.TemporaryDirectory() as directory:
+            result = await self.call("platform", "create_deployment_api_key", args,
+                                     [(200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"}),
+                                      (201, {"appID": "issued-ak", "appSecret": "private-secret"})], state_dir=directory)
+            self.assertNotIn("receipt_path", output(result))
+            self.assertIn("outside the AI client", output(result)["next_step"])
+            self.assertIn("Do not read", output(result)["next_step"])
+            self.assertNotIn(directory, str(result))
+
+    async def test_uncertain_receipts_are_scoped_and_invalid_state_fails_closed(self):
+        args = {"deployment_id": "d", "issuance_id": "new", "whitelist": {"/api/v5/clients": ["GET"]}}
+        record = {"issuance_id": "old", "deployment_id": "d", "platform_endpoint": environment("platform")["EMQXCLOUD_PLATFORM_ENDPOINT"], "status": "uncertain"}
+        ready = (200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})
+        for changes, suffix, blocked in (({}, ".json", True), ({}, ".tmp", True),
+                                          ({"deployment_id": "other"}, ".json", False),
+                                          ({"platform_endpoint": "https://other.example/public_api/v1"}, ".json", False),
+                                          ({"status": "issued", "app_id": "ak", "app_secret": "sk"}, ".json", False),
+                                          ({"status": "rejected"}, ".json", False)):
+            with self.subTest(changes=changes, suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / ("old" + suffix)).write_text(json.dumps(record | changes))
+                result = await self.call("platform", "create_deployment_api_key", args,
+                                         [ready, (201, {"appID": "ak", "appSecret": "sk"})], state_dir=directory)
+                self.assertEqual(result.is_error, blocked)
+                self.assertEqual([r.method for r in self.requests], [] if blocked else ["GET", "POST"])
+        for invalid in ([], None, "string", 12, {}, record | {"status": []}):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / "old.json").write_text(json.dumps(invalid))
+                read = await self.call("platform", "get_deployment_api_key_receipt", {"issuance_id": "old"}, [], state_dir=directory)
+                self.assertTrue(read.is_error)
+                self.assertIn("Receipt is unavailable or invalid", read.content[0].text)
+                create = await self.call("platform", "create_deployment_api_key", args, [], state_dir=directory)
+                self.assertTrue(create.is_error)
+                self.assertEqual(self.requests, [])
+
+    async def test_concurrent_new_ids_cannot_bypass_deployment_guard(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        requests = []
+        async def reply(request):
+            requests.append(request.method)
+            if request.method == "GET":
+                started.set()
+                await release.wait()
+                return httpx2.Response(200, json={"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})
+            return httpx2.Response(503, json={})
+        with tempfile.TemporaryDirectory() as directory:
+            first = build_server("platform", True, environment("platform"), httpx2.AsyncClient(transport=httpx2.MockTransport(reply)), state_dir=directory)
+            second = build_server("platform", True, environment("platform"), httpx2.AsyncClient(transport=httpx2.MockTransport(reply)), state_dir=directory)
+            args = {"deployment_id": "d", "issuance_id": "first", "whitelist": {"/api/v5/clients": ["GET"]}}
+            async with Client(first) as one, Client(second) as two:
+                task = asyncio.create_task(one.call_tool("create_deployment_api_key", args))
+                await asyncio.wait_for(started.wait(), timeout=5)
+                try:
+                    blocked = await two.call_tool("create_deployment_api_key", args | {"issuance_id": "second"})
+                    self.assertTrue(blocked.is_error)
+                    self.assertEqual(requests, ["GET"])
+                finally:
+                    release.set()
+                    result = await task
+                self.assertEqual(output(result)["status"], "uncertain")
+                blocked = await two.call_tool("create_deployment_api_key", args | {"issuance_id": "third"})
+                self.assertTrue(blocked.is_error)
+                self.assertEqual(requests, ["GET", "POST"])
+
+    async def test_bad_connection_data_does_not_hide_successful_paid_creation(self):
+        for connection in ("invalid", {"ports": {}}, {"ports": [None, 123, {"protocol": "mqtts", "port": 8883, "status": "stopped"}]}):
+            result = await self.call("platform", "create_deployment", {"project_id": "p", "platform": "aws", "region": "us-east-1", "connections": 1000, "tps": 1000},
+                                     [(201, {"deploymentID": "created", "status": "pending", "connection": connection})])
+            self.assertFalse(result.is_error)
+            self.assertTrue(output(result)["accepted"])
+            self.assertEqual(output(result)["deploymentID"], "created")
+            self.assertIn("connection_info_warning", output(result))
+            if isinstance(connection, dict) and isinstance(connection["ports"], list):
+                self.assertEqual(output(result)["connection_info"]["ports"], [None, None, {"protocol": "mqtts", "port": 8883, "status": "stopped"}])
+
+    async def test_xdg_state_home_and_local_receipt_annotations(self):
+        for xdg in (None, "relative", ""):
+            env = environment("platform")
+            if xdg is not None:
+                env["XDG_STATE_HOME"] = xdg
+            with tempfile.TemporaryDirectory() as directory, patch("emqxcloud_mcp.Path.home", return_value=Path(directory)):
+                state = Path(directory) / ".local/state/emqx-cloud-mcp"
+                state.mkdir(parents=True)
+                (state / "old.json").write_text(json.dumps({"issuance_id": "old", "deployment_id": "d", "platform_endpoint": env["EMQXCLOUD_PLATFORM_ENDPOINT"], "status": "uncertain"}))
+                async with Client(build_server("platform", env=env)) as client:
+                    result = await client.call_tool("get_deployment_api_key_receipt", {"issuance_id": "old"})
+                    self.assertFalse(result.is_error)
+                    tool = next(t for t in (await client.list_tools()).tools if t.name == "get_deployment_api_key_receipt")
+                    self.assertFalse(tool.annotations.open_world_hint)
+                    self.assertIn("Use get_deployment_api_key_receipt to recover", client.instructions)
+                    self.assertNotIn("Read receipts to recover", client.instructions)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "emqx-cloud-mcp"
+            state.mkdir()
+            (state / "old.json").write_text(json.dumps({"issuance_id": "old", "deployment_id": "d", "platform_endpoint": environment("platform")["EMQXCLOUD_PLATFORM_ENDPOINT"], "status": "uncertain"}))
+            result = await self.call("platform", "get_deployment_api_key_receipt", {"issuance_id": "old"}, [], extra_env={"XDG_STATE_HOME": directory})
+            self.assertFalse(result.is_error)
+            self.assertEqual(self.requests, [])
+
+    async def test_stale_lock_and_unreadable_directory_block_without_http(self):
+        args = {"deployment_id": "d", "issuance_id": "new", "whitelist": {"/api/v5/clients": ["GET"]}}
+        endpoint = environment("platform")["EMQXCLOUD_PLATFORM_ENDPOINT"]
+        with tempfile.TemporaryDirectory() as directory:
+            identity = hashlib.sha256((endpoint + "\0d").encode()).hexdigest()
+            lock = Path(directory) / (identity + ".lock")
+            lock.mkdir()
+            result = await self.call("platform", "create_deployment_api_key", args, [], state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertEqual(self.requests, [])
+            self.assertTrue(lock.exists())
+        with tempfile.TemporaryDirectory() as directory, patch("emqxcloud_mcp.Path.iterdir", side_effect=PermissionError):
+            result = await self.call("platform", "create_deployment_api_key", args, [], state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertEqual(self.requests, [])
+
+    async def test_directory_sync_failure_after_reservation_prevents_post(self):
+        args = {"deployment_id": "d", "issuance_id": "key", "whitelist": {"/api/v5/clients": ["GET"]}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "key.json"
+            def fail_after_reservation(_):
+                if path.exists():
+                    raise OSError
+            with patch("emqxcloud_mcp.sync_directory", side_effect=fail_after_reservation):
+                result = await self.call("platform", "create_deployment_api_key", args,
+                                         [(200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})], state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertEqual([r.method for r in self.requests], ["GET"])
+            self.assertEqual(json.loads(path.read_text())["status"], "uncertain")
+
+    @unittest.skipUnless(os.name == "posix", "Directory fsync is POSIX-only")
+    async def test_receipt_namespace_is_synced_before_post_and_after_replace(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            original_replace = os.replace
+            async def reply(request):
+                if request.method == "GET":
+                    return httpx2.Response(200, json={"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})
+                self.assertEqual(events[-1], "sync")
+                self.assertEqual(json.loads((Path(directory) / "key.json").read_text())["status"], "uncertain")
+                events.append("POST")
+                return httpx2.Response(201, json={"appID": "ak", "appSecret": "sk"})
+            def replace(*args):
+                self.assertEqual(events[-1], "sync")
+                events.append("replace")
+                original_replace(*args)
+            server = build_server("platform", True, environment("platform"), httpx2.AsyncClient(transport=httpx2.MockTransport(reply)), state_dir=directory)
+            with patch("emqxcloud_mcp.sync_directory", side_effect=lambda _: events.append("sync")), patch("emqxcloud_mcp.os.replace", side_effect=replace):
+                async with Client(server) as client:
+                    result = await client.call_tool("create_deployment_api_key", {"deployment_id": "d", "issuance_id": "key", "whitelist": {"/api/v5/clients": ["GET"]}})
+            self.assertFalse(result.is_error)
+            self.assertEqual(events[events.index("replace") + 1], "sync")
+            self.assertEqual(events.count("POST"), 1)
+
+    async def test_key_update_delete_and_replacement_are_unavailable(self):
+        for tool in ("update_deployment_api_key", "delete_deployment_api_key", "replace_deployment_api_key"):
+            result = await self.call("platform", tool, {"issuance_id": "key"}, [])
+            self.assertTrue(result.is_error)
+            self.assertEqual(self.requests, [])
+
+    async def test_connection_info_keeps_null_and_listener_status(self):
+        for connection in (None, {}, {"address": None, "apiEndpoint": None, "ports": None},
+                           {"address": "mqtt.example", "apiEndpoint": "https://api.example/api/v5",
+                            "ports": [{"protocol": "mqtts", "port": 8883, "status": "stopped", "secret": "hidden"}]}):
+            result = await self.call("platform", "get_deployment", {"deployment_id": "d"},
+                                     [(200, {"deploymentID": "d", "connection": connection})])
+            self.assertFalse(result.is_error)
+            info = output(result)["connection_info"]
+            if connection is None:
+                self.assertIsNone(info)
+            else:
+                self.assertEqual(info["api_endpoint"], connection.get("apiEndpoint"))
+                if connection.get("ports"):
+                    self.assertEqual(info["ports"], [{"protocol": "mqtts", "port": 8883, "status": "stopped"}])
+        result = await self.call("platform", "get_deployment", {"deployment_id": "d"}, [(200, {"deploymentID": "d"})])
+        self.assertIsNone(output(result)["connection_info"])
+
+    async def test_key_issuance_retains_secret_and_blocks_repeats_across_restart(self):
+        args = {"deployment_id": "d", "issuance_id": "bootstrap", "whitelist": {"/api/v5/clients": ["GET"]}}
+        for status, body, expected in ((201, {"appID": "issued-ak", "appSecret": "issued-secret"}, "issued"),
+                                       (201, {"appID": "issued-ak"}, "uncertain"),
+                                       (201, {"appID": "issued-ak", "appSecret": "******"}, "uncertain"),
+                                       (200, {"appID": "issued-ak", "appSecret": "issued-secret"}, "uncertain"),
+                                       (503, {"message": "issued-secret"}, "uncertain"),
+                                       (403, {"message": "issued-secret"}, "rejected")):
+            with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as directory:
+                result = await self.call("platform", "create_deployment_api_key", args,
+                                         [(200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"}),
+                                          (status, body)], state_dir=directory)
+                self.assertFalse(result.is_error)
+                self.assertEqual(output(result)["status"], expected)
+                self.assertNotIn("issued-secret", str(result))
+                self.assertNotIn("issued-ak", str(result))
+                self.assertEqual([r.method for r in self.requests], ["GET", "POST"])
+                self.assertEqual(self.requests[1].url.path, "/public_api/v1/deployments/d/applications")
+                self.assertEqual(json.loads(self.requests[1].content), {"whitelist": args["whitelist"], "description": ""})
+                path = Path(directory) / "bootstrap.json"
+                record = json.loads(path.read_text())
+                if expected == "issued":
+                    self.assertEqual(record["app_secret"], "issued-secret")
+                if os.name != "nt":
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                read = await self.call("platform", "get_deployment_api_key_receipt", {"issuance_id": "bootstrap"}, [],
+                                       writes=False, state_dir=directory)
+                self.assertEqual(output(read)["status"], expected)
+                self.assertEqual(self.requests, [])
+                for changes in ({}, {"deployment_id": "other"}, {"whitelist": {"/api/v5/clients": ["DELETE"]}}):
+                    repeated = await self.call("platform", "create_deployment_api_key", args | changes, [], state_dir=directory)
+                    self.assertTrue(repeated.is_error)
+                    self.assertEqual(self.requests, [])
+                    self.assertEqual(json.loads(path.read_text()), record)
+
+    async def test_receipt_reservation_failure_prevents_post(self):
+        args = {"deployment_id": "d", "issuance_id": "key", "whitelist": {"/api/v5/clients": ["GET"]}}
+        original_open = os.open
+        def fail_receipt(path, *args, **kwargs):
+            if str(path).endswith("key.json"):
+                raise FileExistsError
+            return original_open(path, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, patch("emqxcloud_mcp.os.open", side_effect=fail_receipt):
+            result = await self.call("platform", "create_deployment_api_key", args,
+                                     [(200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})],
+                                     state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertEqual([r.method for r in self.requests], ["GET"])
+        result = await self.call("platform", "get_deployment_api_key_receipt", {"issuance_id": "missing"}, [],
+                                 writes=False, state_dir=directory)
+        self.assertTrue(result.is_error)
+        self.assertEqual(self.requests, [])
+
+    async def test_key_lost_response_and_save_failure_keep_recovery_record(self):
+        args = {"deployment_id": "d", "issuance_id": "key", "whitelist": {"/api/v5/clients": ["GET"]}}
+        ready = (200, {"deploymentID": "d", "deploymentType": "dedicatedFlex", "status": "running"})
+        with tempfile.TemporaryDirectory() as directory:
+            result = await self.call("platform", "create_deployment_api_key", args,
+                                     [ready, httpx2.ReadTimeout("private-credential")], state_dir=directory)
+            self.assertEqual(output(result)["status"], "uncertain")
+            self.assertNotIn("private-credential", str(result))
+            self.assertEqual([r.method for r in self.requests], ["GET", "POST"])
+            self.assertEqual(json.loads((Path(directory) / "key.json").read_text())["status"], "uncertain")
+        with tempfile.TemporaryDirectory() as directory, patch("emqxcloud_mcp.os.replace", side_effect=OSError):
+            result = await self.call("platform", "create_deployment_api_key", args,
+                                     [ready, (201, {"appID": "ak", "appSecret": "once-only-secret"})], state_dir=directory)
+            self.assertTrue(result.is_error)
+            self.assertNotIn("once-only-secret", str(result))
+            self.assertEqual(json.loads((Path(directory) / "key.json").read_text())["status"], "uncertain")
+            self.assertEqual(json.loads((Path(directory) / "key.tmp").read_text())["app_secret"], "once-only-secret")
+            read = await self.call("platform", "get_deployment_api_key_receipt", {"issuance_id": "key"}, [], state_dir=directory)
+            self.assertTrue(output(read)["temporary_result_available"])
+            self.assertFalse(output(read)["secret_available"])
+            self.assertNotIn("once-only-secret", str(read))
+            blocked = await self.call("platform", "create_deployment_api_key", args | {"issuance_id": "new"}, [], state_dir=directory)
+            self.assertTrue(blocked.is_error)
+            self.assertEqual(self.requests, [])
+            again = await self.call("platform", "create_deployment_api_key", args, [], state_dir=directory)
+            self.assertTrue(again.is_error)
+            self.assertEqual(self.requests, [])
+
+    async def test_key_validation_and_unready_deployments_never_issue(self):
+        args = {"deployment_id": "d", "issuance_id": "key", "whitelist": {"/api/v5/clients": ["GET"]}}
+        with tempfile.TemporaryDirectory() as directory:
+            for invalid in ({"whitelist": {}}, {"whitelist": {" ": ["GET"]}},
+                            {"whitelist": {"/api/v5/clients": []}}, {"whitelist": {"/api/v5/clients": ["get"]}},
+                            {"issuance_id": "../escape"}, {"description": "x" * 129}):
+                result = await self.call("platform", "create_deployment_api_key", args | invalid, [], state_dir=directory)
+                self.assertTrue(result.is_error)
+                self.assertEqual(self.requests, [])
+            for deployment in ({"deploymentID": "other", "status": "running", "deploymentType": "dedicatedFlex"},
+                               {"deploymentID": "d", "status": "stopped", "deploymentType": "dedicatedFlex"},
+                               {"deploymentID": "d", "status": "running", "deploymentType": "serverless"}):
+                result = await self.call("platform", "create_deployment_api_key", args, [(200, deployment)], state_dir=directory)
+                self.assertTrue(result.is_error)
+                self.assertEqual(len(self.requests), 1)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     async def test_create_contract_and_identity_survive_without_polling(self):
         args = {"project_id": "project-1", "platform": "aws", "region": "us-east-1",
@@ -514,7 +806,7 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     params = StdioServerParameters(command=sys.executable, args=["-B", script, mode], env=environment(mode))
                     async with Client(params, mode=protocol, read_timeout_seconds=10) as client:
                         tools = (await client.list_tools()).tools
-                    self.assertEqual(len(tools), 3 if mode == "platform" else len(DEPLOYMENT_READ))
+                    self.assertEqual(len(tools), 4 if mode == "platform" else len(DEPLOYMENT_READ))
                     self.assertTrue(all(tool.annotations.read_only_hint for tool in tools))
 
     def test_missing_credentials_fail_without_stdout_or_secret_values(self):
